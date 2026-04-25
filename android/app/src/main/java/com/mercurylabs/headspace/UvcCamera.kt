@@ -18,25 +18,26 @@ import java.nio.ByteBuffer
 import kotlin.concurrent.thread
 
 /**
- * Minimal UVC reader for the Mercury Labs Headspace SPC2.
+ * UVC reader for the Mercury Labs Headspace SPC2.
  *
- * Why hand-rolled instead of saki4510t/UVCCamera: that library is JitPack-
- * only, drags an old NDK module, and assumes MJPEG/YUYV. Our gadget speaks
- * H.264 framebased on a single isochronous endpoint, and we just want raw
- * payload bytes streamed back to the caller. Doing it through the public
- * UsbManager + UsbRequest path is ~150 lines and avoids the dep.
+ * What it does, in order:
+ *   1. Find the streaming interface (class=14, subclass=2).
+ *   2. Pick the alt setting with the largest IN endpoint — that's the one
+ *      that actually carries video bytes (alt 0 has zero-bandwidth EPs).
+ *   3. Send VS_PROBE_CONTROL SET_CUR with our format/frame/interval.
+ *   4. GET_CUR — device echoes back its negotiated values (incl. the
+ *      max payload transfer size we should use for reads).
+ *   5. SET_CUR on VS_COMMIT_CONTROL to lock the negotiated settings in.
+ *   6. SET_INTERFACE to that alt — now bytes flow.
+ *   7. Drain the endpoint into the onFrame callback.
  *
- * What this DOES NOT do (yet): UVC class control negotiation (probe/commit).
- * Most modern Android USB hosts will accept the device as-is in its default
- * alt setting. If a particular device requires explicit format negotiation
- * we add it here using controlTransfer() with the standard UVC class
- * requests; for now we use the heuristic of picking the highest-bandwidth
- * alt setting we see on the streaming interface.
+ * The probe/commit byte layout is in UvcControl.kt (UVC 1.1 spec exact).
+ * Mirrors saki4510t/UVCCamera's startup sequence; no Java/JNI dependency.
  */
 class UvcCamera(
     private val ctx: Context,
     private val device: UsbDevice,
-    private val onFrame: (ByteArray, Int, Int) -> Unit,    // (buf, off, len) — payload bytes
+    private val onFrame: (ByteArray, Int, Int) -> Unit,
     private val onError: (String) -> Unit,
 ) {
     private val mgr = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
@@ -49,7 +50,6 @@ class UvcCamera(
     val devName: String get() = device.productName ?: "USB Device"
     val isStreaming: Boolean get() = running
 
-    /** Request user permission, then call [onReady] when granted. */
     fun requestPermissionAndOpen(onReady: () -> Unit) {
         if (mgr.hasPermission(device)) { onReady(); return }
         val action = "com.mercurylabs.headspace.USB_PERMISSION"
@@ -80,66 +80,144 @@ class UvcCamera(
             onError("openDevice returned null"); return
         }
         conn = openConn
-        // Find the first video-class streaming interface. UVC: bInterfaceClass=14.
-        var streamIf: UsbInterface? = null
+
+        // ---- 1. Find streaming interface + best alt setting ---------------
+        // UsbDevice.getInterface() enumerates *all* alt settings as separate
+        // UsbInterface objects. We pick the one with the largest IN endpoint
+        // on a video-streaming class (14/2).
+        var bestIface: UsbInterface? = null
+        var bestEp: UsbEndpoint? = null
+        var streamingIfaceId = -1
         for (i in 0 until device.interfaceCount) {
             val it = device.getInterface(i)
-            if (it.interfaceClass == UsbConstants.USB_CLASS_VIDEO &&
-                it.interfaceSubclass == 2 /* SC_VIDEOSTREAMING */) {
-                streamIf = it
-                break
+            if (it.interfaceClass != UsbConstants.USB_CLASS_VIDEO ||
+                it.interfaceSubclass != 2) continue
+            for (e in 0 until it.endpointCount) {
+                val ep = it.getEndpoint(e)
+                if (ep.direction != UsbConstants.USB_DIR_IN) continue
+                if (bestEp == null || ep.maxPacketSize > bestEp.maxPacketSize) {
+                    bestEp = ep
+                    bestIface = it
+                    streamingIfaceId = it.id
+                }
             }
         }
-        if (streamIf == null) {
-            onError("no UVC streaming interface (class=14, subclass=2)"); release(); return
+        if (bestIface == null || bestEp == null) {
+            onError("no UVC streaming endpoint found"); release(); return
         }
-        if (!openConn.claimInterface(streamIf, true)) {
+        Log.i(TAG, "streaming iface id=$streamingIfaceId alt=${bestIface.alternateSetting} " +
+                   "ep=0x${bestEp.address.toString(16)} type=${bestEp.type} " +
+                   "maxPacket=${bestEp.maxPacketSize}")
+
+        // Claim the interface BEFORE setInterface — Android API requirement.
+        if (!openConn.claimInterface(bestIface, true)) {
             onError("claimInterface failed"); release(); return
         }
-        iface = streamIf
-        // Pick the bulk OR isochronous IN endpoint with the largest packet
-        // size — that's the one carrying our 1080p H.264 frames.
-        var best: UsbEndpoint? = null
-        for (e in 0 until streamIf.endpointCount) {
-            val ep = streamIf.getEndpoint(e)
-            if (ep.direction != UsbConstants.USB_DIR_IN) continue
-            if (best == null || ep.maxPacketSize > best.maxPacketSize) best = ep
-        }
-        if (best == null) { onError("no IN endpoint"); release(); return }
-        endpoint = best
-        Log.i(TAG, "streaming endpoint: addr=0x${best.address.toString(16)} type=${best.type} mps=${best.maxPacketSize}")
+        iface = bestIface
 
+        // ---- 2-4. Probe / commit -----------------------------------------
+        // Format index 1, frame index 1, 30 fps (333333 × 100ns). These are
+        // the values our gadget exposes via configfs.
+        val probe = UvcControl.buildProbe(
+            formatIndex = 1, frameIndex = 1, frameInterval100ns = 333_333,
+        )
+
+        // SET_CUR(probe)
+        val setRc = openConn.controlTransfer(
+            UvcControl.BM_REQ_SET, UvcControl.SET_CUR,
+            UvcControl.VS_PROBE_CONTROL shl 8,
+            streamingIfaceId,
+            probe, probe.size, CTRL_TIMEOUT_MS,
+        )
+        if (setRc != probe.size) {
+            // Some devices reject the request before they're committed once;
+            // log it and continue — many will accept GET_CUR / SET_INTERFACE
+            // anyway and start streaming on default values.
+            Log.w(TAG, "SET_CUR(probe) wrote $setRc/${probe.size}, continuing")
+        }
+
+        // GET_CUR(probe) — read what the device negotiated
+        val negotiated = ByteArray(UvcControl.PROBE_LEN)
+        val getRc = openConn.controlTransfer(
+            UvcControl.BM_REQ_GET, UvcControl.GET_CUR,
+            UvcControl.VS_PROBE_CONTROL shl 8,
+            streamingIfaceId,
+            negotiated, negotiated.size, CTRL_TIMEOUT_MS,
+        )
+        val negotiatedOK = getRc == negotiated.size
+        if (negotiatedOK) {
+            Log.i(TAG, "negotiated dwMaxVideoFrameSize=${UvcControl.parseMaxVideoFrameSize(negotiated)} " +
+                       "dwMaxPayloadTransferSize=${UvcControl.parseMaxPayloadTransferSize(negotiated)}")
+        } else {
+            Log.w(TAG, "GET_CUR(probe) returned $getRc, falling back to our request bytes")
+        }
+
+        // SET_CUR(commit) with the negotiated bytes (or our originals as fallback)
+        val commitPayload = if (negotiatedOK) negotiated else probe
+        val commitRc = openConn.controlTransfer(
+            UvcControl.BM_REQ_SET, UvcControl.SET_CUR,
+            UvcControl.VS_COMMIT_CONTROL shl 8,
+            streamingIfaceId,
+            commitPayload, commitPayload.size, CTRL_TIMEOUT_MS,
+        )
+        if (commitRc != commitPayload.size) {
+            Log.w(TAG, "SET_CUR(commit) wrote $commitRc/${commitPayload.size}")
+        }
+
+        // ---- 5. SET_INTERFACE — switch to the data-carrying alt ---------
+        // Android's UsbDeviceConnection has setInterface() but it actually
+        // does claimInterface again on the *new* alt setting. The official
+        // way to switch alt is via controlTransfer SET_INTERFACE.
+        // Reference: USB 2.0 spec 9.4.10.
+        val setIfaceRc = openConn.controlTransfer(
+            0x01,                                 // bmReqType: standard, interface
+            0x0B,                                 // bRequest: SET_INTERFACE
+            bestIface.alternateSetting,           // wValue: alt setting
+            streamingIfaceId,                     // wIndex: interface
+            null, 0, CTRL_TIMEOUT_MS,
+        )
+        if (setIfaceRc < 0) {
+            Log.w(TAG, "SET_INTERFACE returned $setIfaceRc (alt=${bestIface.alternateSetting})")
+        } else {
+            Log.i(TAG, "SET_INTERFACE alt=${bestIface.alternateSetting} OK")
+        }
+
+        endpoint = bestEp
         running = true
-        readerThread = thread(name = "uvc-reader", isDaemon = true) { readerLoop(openConn, best) }
+        readerThread = thread(name = "uvc-reader", isDaemon = true) {
+            readerLoop(openConn, bestEp,
+                maxPayload = if (negotiatedOK) UvcControl.parseMaxPayloadTransferSize(negotiated) else 0)
+        }
     }
 
-    private fun readerLoop(c: UsbDeviceConnection, ep: UsbEndpoint) {
+    private fun readerLoop(c: UsbDeviceConnection, ep: UsbEndpoint, maxPayload: Int) {
         val mps = ep.maxPacketSize.coerceAtLeast(512)
         val req = UsbRequest()
         if (!req.initialize(c, ep)) {
             onError("UsbRequest.initialize failed"); return
         }
-        // For isochronous endpoints we issue many small reads; for bulk one
-        // big read. Either way we feed the bytes downstream as they arrive.
-        val bufSize = if (ep.type == UsbConstants.USB_ENDPOINT_XFER_ISOC) mps * 8 else 64 * 1024
-        var lastRefill = 0L
+        val readSize = when {
+            maxPayload in 1..(64 * 1024) -> maxPayload
+            ep.type == UsbConstants.USB_ENDPOINT_XFER_ISOC -> mps * 8
+            else -> 64 * 1024
+        }
+        var idleSince = System.currentTimeMillis()
         while (running) {
-            val bb = ByteBuffer.allocate(bufSize)
-            if (!req.queue(bb, bufSize)) {
+            val bb = ByteBuffer.allocate(readSize)
+            if (!req.queue(bb, readSize)) {
                 onError("queue() failed"); break
             }
-            val resp = c.requestWait(500)  // ms
+            val resp = c.requestWait(500)
             if (resp == null) {
-                // Timeout — UVC alt-setting may need explicit selection. Log
-                // and continue so we don't spin forever.
-                if (System.currentTimeMillis() - lastRefill > 2000) {
-                    Log.w(TAG, "no UVC packets in 500ms — device may need probe/commit")
-                    lastRefill = System.currentTimeMillis()
+                if (System.currentTimeMillis() - idleSince > 2000) {
+                    Log.w(TAG, "no UVC packets in 2s — re-trying probe/commit may help")
+                    idleSince = System.currentTimeMillis()
                 }
                 continue
             }
             val n = bb.position()
             if (n > 0) {
+                idleSince = System.currentTimeMillis()
                 val arr = ByteArray(n)
                 bb.rewind()
                 bb.get(arr, 0, n)
@@ -153,6 +231,10 @@ class UvcCamera(
         if (!running) return
         running = false
         readerThread?.join(1000)
+        // Send SET_INTERFACE alt 0 to release bandwidth before close.
+        try {
+            conn?.controlTransfer(0x01, 0x0B, 0, iface?.id ?: 0, null, 0, CTRL_TIMEOUT_MS)
+        } catch (_: Throwable) {}
         release()
     }
 
@@ -166,5 +248,6 @@ class UvcCamera(
 
     companion object {
         private const val TAG = "UvcCamera"
+        private const val CTRL_TIMEOUT_MS = 1000
     }
 }

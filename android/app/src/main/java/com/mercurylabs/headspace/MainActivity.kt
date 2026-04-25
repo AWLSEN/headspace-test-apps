@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -49,7 +50,16 @@ class MainActivity : ComponentActivity() {
 
         handleUsbAttach(intent)
 
-        setContent { App(onOpenRecording = { openRecording(it) }) }
+        setContent {
+            var screen by remember { mutableStateOf("home") }
+            when (screen) {
+                "home" -> App(
+                    onOpenRecording = { openRecording(it) },
+                    onOpenWifiSetup = { screen = "wifi" },
+                )
+                "wifi" -> WifiSetupScreen(onBack = { screen = "home" })
+            }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -76,7 +86,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun App(onOpenRecording: (Recording) -> Unit) {
+private fun App(onOpenRecording: (Recording) -> Unit, onOpenWifiSetup: () -> Unit) {
     val ctx = LocalContext.current
     var recordings by remember { mutableStateOf(Recordings.list(ctx)) }
     // Refresh the list whenever the activity resumes (e.g. after recording stops).
@@ -89,6 +99,9 @@ private fun App(onOpenRecording: (Recording) -> Unit) {
                 CenterAlignedTopAppBar(
                     title = { Text("Headspace Recorder", fontWeight = FontWeight.SemiBold) },
                     actions = {
+                        IconButton(onClick = onOpenWifiSetup) {
+                            Icon(Icons.Filled.Wifi, contentDescription = "WiFi setup")
+                        }
                         IconButton(onClick = { recordings = Recordings.list(ctx) }) {
                             Icon(Icons.Filled.Folder, contentDescription = "Refresh")
                         }
@@ -184,5 +197,5 @@ private fun RecordingRow(rec: Recording, onClick: () -> Unit) {
 @Preview
 @Composable
 private fun AppPreview() {
-    MaterialTheme { App(onOpenRecording = {}) }
+    MaterialTheme { App(onOpenRecording = {}, onOpenWifiSetup = {}) }
 }

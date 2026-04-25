@@ -71,8 +71,21 @@ class RecordingService : LifecycleService() {
 
     override fun onCreate() {
         super.onCreate()
+        CrashLog.line(this, "RecordingService", "onCreate")
         ensureChannel()
-        startForeground(NOTIF_ID, buildNotification("Headspace recorder ready"))
+        // CRITICAL: must call startForeground within ~5s of startForegroundService
+        // or Android 12+ throws ForegroundServiceDidNotStartInTimeException. Do
+        // it as the very first thing in onCreate.
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIF_ID, buildNotification("Headspace recorder ready"),
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+            } else {
+                startForeground(NOTIF_ID, buildNotification("Headspace recorder ready"))
+            }
+        } catch (e: Throwable) {
+            CrashLog.writeException(this, "startForeground failed", e)
+        }
         val filter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(detachReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -98,40 +111,52 @@ class RecordingService : LifecycleService() {
     }
 
     private fun startRecording(device: UsbDevice) {
-        val dir = Recordings.newSession(this).also { sessionDir = it }
-        val v = File(dir, "video.h264")
-        val i = File(dir, "imu.imu")
-        videoOut = FileOutputStream(v)
-        imuOut = FileOutputStream(i)
-        imuWriter = ImuCsvWriter(imuOut!!)
-        startedAt = Date()
-        bytesWritten = 0; frameCount = 0; imuCount = 0; firstFrameAt = 0
-        sei = SeiParser { s ->
-            imuWriter?.write(s)
-            imuCount++
-            tracker.tick(s.boottimeNs)
-        }
-        Log.i(TAG, "starting session: ${dir.absolutePath}")
+        try {
+            val dir = Recordings.newSession(this).also { sessionDir = it }
+            val v = File(dir, "video.h264")
+            val i = File(dir, "imu.imu")
+            videoOut = FileOutputStream(v)
+            imuOut = FileOutputStream(i)
+            imuWriter = ImuCsvWriter(imuOut!!)
+            startedAt = Date()
+            bytesWritten = 0; frameCount = 0; imuCount = 0; firstFrameAt = 0
+            sei = SeiParser { s ->
+                try {
+                    imuWriter?.write(s); imuCount++; tracker.tick(s.boottimeNs)
+                } catch (e: Throwable) { CrashLog.writeException(this, "sei write", e) }
+            }
+            CrashLog.line(this, "RecordingService", "starting session: ${dir.absolutePath}")
 
-        camera = UvcCamera(
-            ctx = this,
-            device = device,
-            onFrame = { buf, off, len ->
-                val out = videoOut ?: return@UvcCamera
-                out.write(buf, off, len)
-                bytesWritten += len
-                if (firstFrameAt == 0L) firstFrameAt = System.currentTimeMillis()
-                frameCount++   // approx — counts USB chunks, not frames
-                sei?.feed(buf, off, len)
-                if (frameCount % 30L == 0L) postStatus()
-            },
-            onError = { msg ->
-                Log.e(TAG, "uvc error: $msg")
-                updateNotification("Error: $msg")
-            },
-        )
-        camera!!.requestPermissionAndOpen { camera!!.start() }
-        updateNotification("Recording — ${device.productName ?: "device"}")
+            camera = UvcCamera(
+                ctx = this,
+                device = device,
+                onFrame = { buf, off, len ->
+                    try {
+                        val out = videoOut ?: return@UvcCamera
+                        out.write(buf, off, len)
+                        bytesWritten += len
+                        if (firstFrameAt == 0L) firstFrameAt = System.currentTimeMillis()
+                        frameCount++
+                        sei?.feed(buf, off, len)
+                        if (frameCount % 30L == 0L) postStatus()
+                    } catch (e: Throwable) {
+                        CrashLog.writeException(this, "onFrame", e)
+                    }
+                },
+                onError = { msg ->
+                    CrashLog.line(this, "UvcCamera", "ERROR: $msg")
+                    updateNotification("Error: $msg")
+                },
+            )
+            camera!!.requestPermissionAndOpen {
+                try { camera!!.start() }
+                catch (e: Throwable) { CrashLog.writeException(this, "camera.start", e) }
+            }
+            updateNotification("Recording — ${device.productName ?: "device"}")
+        } catch (e: Throwable) {
+            CrashLog.writeException(this, "startRecording top-level", e)
+            updateNotification("Error: ${e.javaClass.simpleName} ${e.message}")
+        }
     }
 
     private fun stopRecording(reason: String) {

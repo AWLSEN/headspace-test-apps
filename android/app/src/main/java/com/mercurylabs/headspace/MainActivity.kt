@@ -17,6 +17,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Wifi
@@ -42,6 +43,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CrashLog.init(this)
+        CrashLog.line(this, "MainActivity", "onCreate intent=${intent.action}")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED) {
@@ -56,8 +59,10 @@ class MainActivity : ComponentActivity() {
                 "home" -> App(
                     onOpenRecording = { openRecording(it) },
                     onOpenWifiSetup = { screen = "wifi" },
+                    onOpenDiagnostics = { screen = "diag" },
                 )
                 "wifi" -> WifiSetupScreen(onBack = { screen = "home" })
+                "diag" -> DiagnosticsScreen(onBack = { screen = "home" })
             }
         }
     }
@@ -68,10 +73,30 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleUsbAttach(intent: Intent?) {
-        if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
-        val device: UsbDevice = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE) ?: return
-        // Plug-and-play: hand off to the foreground service immediately.
-        RecordingService.start(this, device)
+        if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+            CrashLog.line(this, "USB", "handleUsbAttach: action=${intent?.action} (ignored)")
+            return
+        }
+        val device: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+        if (device == null) {
+            CrashLog.line(this, "USB", "USB_DEVICE_ATTACHED with null device extra"); return
+        }
+        CrashLog.line(this, "USB",
+            "attached: vid=${"0x%04x".format(device.vendorId)} " +
+            "pid=${"0x%04x".format(device.productId)} " +
+            "name='${device.productName}' ifaces=${device.interfaceCount}")
+        for (i in 0 until device.interfaceCount) {
+            val it = device.getInterface(i)
+            CrashLog.line(this, "USB",
+                "  iface[$i] id=${it.id} alt=${it.alternateSetting} " +
+                "class=${it.interfaceClass} sub=${it.interfaceSubclass} " +
+                "endpoints=${it.endpointCount}")
+        }
+        try {
+            RecordingService.start(this, device)
+        } catch (e: Throwable) {
+            CrashLog.writeException(this, "RecordingService.start failed", e)
+        }
     }
 
     private fun openRecording(rec: Recording) {
@@ -86,7 +111,11 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun App(onOpenRecording: (Recording) -> Unit, onOpenWifiSetup: () -> Unit) {
+private fun App(
+    onOpenRecording: (Recording) -> Unit,
+    onOpenWifiSetup: () -> Unit,
+    onOpenDiagnostics: () -> Unit,
+) {
     val ctx = LocalContext.current
     var recordings by remember { mutableStateOf(Recordings.list(ctx)) }
     // Refresh the list whenever the activity resumes (e.g. after recording stops).
@@ -99,6 +128,9 @@ private fun App(onOpenRecording: (Recording) -> Unit, onOpenWifiSetup: () -> Uni
                 CenterAlignedTopAppBar(
                     title = { Text("Headspace Recorder", fontWeight = FontWeight.SemiBold) },
                     actions = {
+                        IconButton(onClick = onOpenDiagnostics) {
+                            Icon(Icons.Filled.BugReport, contentDescription = "Diagnostics")
+                        }
                         IconButton(onClick = onOpenWifiSetup) {
                             Icon(Icons.Filled.Wifi, contentDescription = "WiFi setup")
                         }
@@ -197,5 +229,5 @@ private fun RecordingRow(rec: Recording, onClick: () -> Unit) {
 @Preview
 @Composable
 private fun AppPreview() {
-    MaterialTheme { App(onOpenRecording = {}, onOpenWifiSetup = {}) }
+    MaterialTheme { App(onOpenRecording = {}, onOpenWifiSetup = {}, onOpenDiagnostics = {}) }
 }

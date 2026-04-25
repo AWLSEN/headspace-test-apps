@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Mercury Labs Headspace SPC2: VID 0x1d6b (Linux Foundation gadget),
+         PID 0x0104. Matches our configfs gadget descriptor exactly. -->
+    <usb-device vendor-id="7531" product-id="260"/>
+
+    <!-- Catch-all for any UVC video class device, so a developer plugging
+         in any other webcam-style UVC device sees the app activate too.
+         Class 14 = Video, subclass 2 = Streaming. -->
+    <usb-device class="239" subclass="2" protocol="1"/>
+</resources>

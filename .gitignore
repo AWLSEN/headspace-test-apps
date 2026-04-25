@@ -1,0 +1,19 @@
+# Swift
+mac/.build/
+mac/.swiftpm/
+mac/*.xcodeproj
+mac/Package.resolved
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/captures/
+android/*.iml
+android/.cxx/
+
+# OS
+.DS_Store
+*.swp

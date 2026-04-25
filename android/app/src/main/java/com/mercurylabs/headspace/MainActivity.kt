@@ -41,6 +41,18 @@ class MainActivity : ComponentActivity() {
     private val notifPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* ignored */ }
 
+    // Android 14+ requires CAMERA runtime grant before we can start a
+    // foreground service of type "camera". Without it, startForeground
+    // throws SecurityException and the service crashes on creation.
+    private var pendingDevice: UsbDevice? = null
+    private val cameraPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            CrashLog.line(this, "perm", "CAMERA granted=$granted")
+            val d = pendingDevice
+            pendingDevice = null
+            if (granted && d != null) startRecordingFor(d)
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         CrashLog.init(this)
@@ -92,6 +104,17 @@ class MainActivity : ComponentActivity() {
                 "class=${it.interfaceClass} sub=${it.interfaceSubclass} " +
                 "endpoints=${it.endpointCount}")
         }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            != PackageManager.PERMISSION_GRANTED) {
+            CrashLog.line(this, "perm", "CAMERA not granted — requesting before service start")
+            pendingDevice = device
+            cameraPermission.launch(Manifest.permission.CAMERA)
+            return
+        }
+        startRecordingFor(device)
+    }
+
+    private fun startRecordingFor(device: UsbDevice) {
         try {
             RecordingService.start(this, device)
         } catch (e: Throwable) {

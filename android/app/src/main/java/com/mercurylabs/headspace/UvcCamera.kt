@@ -105,15 +105,38 @@ class UvcCamera(
         if (bestIface == null || bestEp == null) {
             onError("no UVC streaming endpoint found"); release(); return
         }
-        Log.i(TAG, "streaming iface id=$streamingIfaceId alt=${bestIface.alternateSetting} " +
-                   "ep=0x${bestEp.address.toString(16)} type=${bestEp.type} " +
-                   "maxPacket=${bestEp.maxPacketSize}")
+        val epTypeName = when (bestEp.type) {
+            UsbConstants.USB_ENDPOINT_XFER_BULK -> "BULK"
+            UsbConstants.USB_ENDPOINT_XFER_ISOC -> "ISO"
+            UsbConstants.USB_ENDPOINT_XFER_INT -> "INT"
+            else -> "type=${bestEp.type}"
+        }
+        val streamInfo = "streaming iface id=$streamingIfaceId alt=${bestIface.alternateSetting} " +
+                "ep=0x${bestEp.address.toString(16)} $epTypeName maxPacket=${bestEp.maxPacketSize}"
+        Log.i(TAG, streamInfo)
+        CrashLog.line(ctx, TAG, streamInfo)
 
         // Claim the interface BEFORE setInterface — Android API requirement.
         if (!openConn.claimInterface(bestIface, true)) {
             onError("claimInterface failed"); release(); return
         }
         iface = bestIface
+
+        // CRITICAL: when the streaming interface has multiple alt settings
+        // (alt=0 zero-bandwidth + alt=1 data-carrying), claimInterface alone
+        // leaves Android pointing at alt=0. We MUST call setInterface() so
+        // both Android's internal state AND the device switch to alt=1.
+        // Without this, UsbRequest.initialize() looks up the endpoint on
+        // alt=0 (which has zero endpoints) and returns false — exactly the
+        // crash we saw on the first field test.
+        if (bestIface.alternateSetting != 0) {
+            val ok = openConn.setInterface(bestIface)
+            CrashLog.line(ctx, TAG, "setInterface(alt=${bestIface.alternateSetting})=$ok")
+            if (!ok) {
+                onError("setInterface(alt=${bestIface.alternateSetting}) failed")
+                release(); return
+            }
+        }
 
         // ---- 2-4. Probe / commit -----------------------------------------
         // Format index 1, frame index 1, 30 fps (333333 × 100ns). These are
@@ -185,16 +208,52 @@ class UvcCamera(
         endpoint = bestEp
         running = true
         readerThread = thread(name = "uvc-reader", isDaemon = true) {
-            readerLoop(openConn, bestEp,
-                maxPayload = if (negotiatedOK) UvcControl.parseMaxPayloadTransferSize(negotiated) else 0)
+            val maxPayload = if (negotiatedOK) UvcControl.parseMaxPayloadTransferSize(negotiated) else 0
+            if (bestEp.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                bulkReaderLoop(openConn, bestEp, maxPayload)
+            } else {
+                asyncReaderLoop(openConn, bestEp, maxPayload)
+            }
         }
     }
 
-    private fun readerLoop(c: UsbDeviceConnection, ep: UsbEndpoint, maxPayload: Int) {
+    // Bulk path — synchronous bulkTransfer. The Pi UVC gadget streams H.264
+    // over a bulk endpoint, which is what bulkTransfer is built for. Avoids
+    // UsbRequest.initialize, which intermittently returns false right after
+    // an alt-setting switch on Android 14+.
+    private fun bulkReaderLoop(c: UsbDeviceConnection, ep: UsbEndpoint, maxPayload: Int) {
+        val readSize = if (maxPayload in 1..(256 * 1024)) maxPayload else 64 * 1024
+        val buf = ByteArray(readSize)
+        var idleSince = System.currentTimeMillis()
+        var consecutiveErrors = 0
+        while (running) {
+            val n = c.bulkTransfer(ep, buf, buf.size, 500)
+            if (n < 0) {
+                consecutiveErrors++
+                if (System.currentTimeMillis() - idleSince > 2000) {
+                    Log.w(TAG, "no UVC packets in 2s (bulkTransfer=$n)")
+                    idleSince = System.currentTimeMillis()
+                }
+                if (consecutiveErrors > 200) {
+                    onError("bulkTransfer kept failing — device unplugged?"); break
+                }
+                continue
+            }
+            consecutiveErrors = 0
+            if (n > 0) {
+                idleSince = System.currentTimeMillis()
+                onFrame(buf, 0, n)
+            }
+        }
+    }
+
+    // ISO path — keeps the original UsbRequest queue/requestWait flow.
+    // Only used if the device negotiates an isochronous streaming endpoint.
+    private fun asyncReaderLoop(c: UsbDeviceConnection, ep: UsbEndpoint, maxPayload: Int) {
         val mps = ep.maxPacketSize.coerceAtLeast(512)
         val req = UsbRequest()
         if (!req.initialize(c, ep)) {
-            onError("UsbRequest.initialize failed"); return
+            onError("UsbRequest.initialize failed (ep type=${ep.type})"); return
         }
         val readSize = when {
             maxPayload in 1..(64 * 1024) -> maxPayload

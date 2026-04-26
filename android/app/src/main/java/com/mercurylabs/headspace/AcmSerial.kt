@@ -36,6 +36,7 @@ import kotlin.concurrent.thread
 class AcmSerial(
     private val conn: UsbDeviceConnection,
     private val dataIface: UsbInterface,
+    private val commsIfaceId: Int,
     private val epIn: UsbEndpoint,
     private val epOut: UsbEndpoint,
 ) {
@@ -45,16 +46,21 @@ class AcmSerial(
 
     init {
         if (!claimed) throw IOException("claimInterface(${dataIface.id}) failed")
-        // SET_LINE_CODING — 115200, 8N1. Bytes: dwDTERate (4 LE) + bCharFormat (1)
-        //                                        + bParityType (1) + bDataBits (1)
+        // CDC class-specific control requests target the COMMUNICATIONS
+        // interface (not the Data interface). Linux's f_acm.c routes by
+        // wIndex == ctrl_id; sending these to the data iface is silently
+        // dropped — usually harmless (Linux gadget defaults DTR=on) but
+        // some hosts care. We send to the comms iface for correctness.
+        val target = commsIfaceId
+        // SET_LINE_CODING — 115200, 8N1.
         val lineCoding = byteArrayOf(
-            0x00.toByte(), 0xC2.toByte(), 0x01.toByte(), 0x00.toByte(),  // 115200
+            0x00.toByte(), 0xC2.toByte(), 0x01.toByte(), 0x00.toByte(),
             0x00, 0x00, 0x08
         )
-        conn.controlTransfer(0x21, 0x20, 0, dataIface.id, lineCoding, lineCoding.size, 200)
+        conn.controlTransfer(0x21, 0x20, 0, target, lineCoding, lineCoding.size, 200)
         // SET_CONTROL_LINE_STATE — DTR + RTS asserted
-        conn.controlTransfer(0x21, 0x22, 0x03, dataIface.id, null, 0, 200)
-        Log.i(TAG, "AcmSerial ready (iface=${dataIface.id} in=0x${epIn.address.toString(16)} out=0x${epOut.address.toString(16)})")
+        conn.controlTransfer(0x21, 0x22, 0x03, target, null, 0, 200)
+        Log.i(TAG, "AcmSerial ready (data=${dataIface.id} comms=$commsIfaceId in=0x${epIn.address.toString(16)} out=0x${epOut.address.toString(16)})")
     }
 
     /** Send a single line; appends "\n". Blocks up to `timeoutMs`. */
@@ -133,6 +139,12 @@ class AcmSerial(
                 Log.w(TAG, "no CDC-Data (class 0x0A) interface on ${device.productName}")
                 return null
             }
+            // Find the matching CDC-Comms interface for class control
+            // requests (SET_LINE_CODING, SET_CONTROL_LINE_STATE).
+            val commsIfaceId = (0 until device.interfaceCount)
+                .map { device.getInterface(it) }
+                .firstOrNull { it.interfaceClass == 2 && it.interfaceSubclass == 2 }
+                ?.id ?: data.id
             var epIn: UsbEndpoint? = null
             var epOut: UsbEndpoint? = null
             for (e in 0 until data.endpointCount) {
@@ -144,7 +156,7 @@ class AcmSerial(
             if (epIn == null || epOut == null) {
                 Log.w(TAG, "CDC-Data missing bulk endpoints"); return null
             }
-            return AcmSerial(conn, data, epIn, epOut)
+            return AcmSerial(conn, data, commsIfaceId, epIn, epOut)
         }
     }
 }

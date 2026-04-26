@@ -209,12 +209,35 @@ class UvcCamera(
         running = true
         readerThread = thread(name = "uvc-reader", isDaemon = true) {
             val maxPayload = if (negotiatedOK) UvcControl.parseMaxPayloadTransferSize(negotiated) else 0
-            if (bestEp.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+            // Try bulkTransfer FIRST regardless of declared endpoint type.
+            // On many Android USB stacks (especially Mediatek-based phones —
+            // moto g45, OnePlus mid-range, Realme) bulkTransfer transparently
+            // works on iso streaming endpoints, while UsbRequest.initialize()
+            // intermittently fails. Probe for 3s — if any bytes arrive, stay
+            // on the bulk path; otherwise fall back to UsbRequest.
+            CrashLog.line(ctx, TAG, "trying bulkTransfer on ep type=${bestEp.type}")
+            val gotBytes = probeWithBulk(openConn, bestEp, maxPayload)
+            if (gotBytes) {
+                CrashLog.line(ctx, TAG, "bulkTransfer is producing data — staying on bulk path")
                 bulkReaderLoop(openConn, bestEp, maxPayload)
             } else {
+                CrashLog.line(ctx, TAG, "bulk silent for 3s — switching to UsbRequest")
                 asyncReaderLoop(openConn, bestEp, maxPayload)
             }
         }
+    }
+
+    /** 3-second smoke test: try bulkTransfer; return true the moment we see
+     *  any non-zero read. Forwards bytes onward via onFrame. */
+    private fun probeWithBulk(c: UsbDeviceConnection, ep: UsbEndpoint, maxPayload: Int): Boolean {
+        val readSize = if (maxPayload in 1..(256 * 1024)) maxPayload else 64 * 1024
+        val buf = ByteArray(readSize)
+        val deadline = System.currentTimeMillis() + 3000
+        while (System.currentTimeMillis() < deadline && running) {
+            val n = c.bulkTransfer(ep, buf, buf.size, 500)
+            if (n > 0) { onFrame(buf, 0, n); return true }
+        }
+        return false
     }
 
     // Bulk path — synchronous bulkTransfer. The Pi UVC gadget streams H.264

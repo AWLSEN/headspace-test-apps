@@ -55,6 +55,8 @@ class RecordingService : LifecycleService() {
     private var frameCount: Long = 0L
     private var imuCount: Long = 0L
     private val tracker = ImuRateTracker()
+    private var preview: PreviewDecoder? = null
+    private var startedPreviewWithSurface: android.view.Surface? = null
 
     private val detachReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
@@ -95,18 +97,42 @@ class RecordingService : LifecycleService() {
         }
     }
 
+    private var pendingDevice: UsbDevice? = null
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        val device: UsbDevice? = intent?.getParcelableExtra(EXTRA_DEVICE)
-        if (device == null) {
-            Log.w(TAG, "onStartCommand without device extra — ignoring")
-            return START_NOT_STICKY
+        val action = intent?.action
+        when (action) {
+            ACTION_DEVICE_ATTACHED -> {
+                val device: UsbDevice? = intent.getParcelableExtra(EXTRA_DEVICE)
+                if (device == null) {
+                    CrashLog.line(this, TAG, "ATTACHED with null device, ignoring")
+                    return START_NOT_STICKY
+                }
+                pendingDevice = device
+                RecorderState.setReady(device.productName ?: "USB Device")
+                updateNotification("Device ready — tap RECORD")
+                CrashLog.line(this, TAG, "device ready: ${device.productName}")
+            }
+            ACTION_START_RECORDING -> {
+                val device = pendingDevice
+                if (device == null) {
+                    CrashLog.line(this, TAG, "START requested but no device attached")
+                    RecorderState.setError("No device — plug in the Headspace SPC2 first")
+                    return START_NOT_STICKY
+                }
+                if (camera != null) {
+                    CrashLog.line(this, TAG, "already recording, ignoring START")
+                    return START_NOT_STICKY
+                }
+                startRecording(device)
+            }
+            ACTION_STOP_RECORDING -> {
+                if (camera != null) stopRecording("user_stopped")
+                pendingDevice?.let { RecorderState.setReady(it.productName ?: "USB Device") }
+                    ?: RecorderState.setIdle()
+            }
         }
-        if (camera != null) {
-            Log.i(TAG, "session already running — ignoring re-start")
-            return START_NOT_STICKY
-        }
-        startRecording(device)
         return START_STICKY
     }
 
@@ -126,6 +152,7 @@ class RecordingService : LifecycleService() {
                 } catch (e: Throwable) { CrashLog.writeException(this, "sei write", e) }
             }
             CrashLog.line(this, "RecordingService", "starting session: ${dir.absolutePath}")
+            RecorderState.setRecording(dir.absolutePath, dir.name, device.productName ?: "USB Device")
 
             camera = UvcCamera(
                 ctx = this,
@@ -138,6 +165,20 @@ class RecordingService : LifecycleService() {
                         if (firstFrameAt == 0L) firstFrameAt = System.currentTimeMillis()
                         frameCount++
                         sei?.feed(buf, off, len)
+                        // Pump bytes into the preview decoder if the UI gave
+                        // us a Surface. Lazy-create the decoder on first frame
+                        // (and re-create if the surface changed mid-recording).
+                        val sfc = RecorderState.previewSurface
+                        if (sfc != null && sfc != startedPreviewWithSurface) {
+                            try { preview?.stop() } catch (_: Throwable) {}
+                            preview = PreviewDecoder().also { it.start(sfc) }
+                            startedPreviewWithSurface = sfc
+                        } else if (sfc == null && preview != null) {
+                            try { preview?.stop() } catch (_: Throwable) {}
+                            preview = null; startedPreviewWithSurface = null
+                        }
+                        preview?.feed(buf, off, len)
+                        preview?.let { RecorderState.framesDecoded = it.framesDecoded }
                         if (frameCount % 30L == 0L) postStatus()
                     } catch (e: Throwable) {
                         CrashLog.writeException(this, "onFrame", e)
@@ -163,6 +204,8 @@ class RecordingService : LifecycleService() {
         val dir = sessionDir ?: return
         Log.i(TAG, "stopping session ($reason): ${dir.absolutePath}")
         camera?.stop(); camera = null
+        try { preview?.stop() } catch (_: Throwable) {}
+        preview = null; startedPreviewWithSurface = null
         try { videoOut?.flush(); videoOut?.close() } catch (_: Exception) {}
         try { imuOut?.flush(); imuOut?.close() } catch (_: Exception) {}
         videoOut = null; imuOut = null; imuWriter = null
@@ -198,8 +241,15 @@ class RecordingService : LifecycleService() {
 
     // ---- notification plumbing ----
 
+    private var lastStatsAt = System.currentTimeMillis()
+    private var lastBytes = 0L
+
     private fun postStatus() {
         val dir = sessionDir ?: return
+        val now = System.currentTimeMillis()
+        val mbps = ((bytesWritten - lastBytes) * 8.0) / ((now - lastStatsAt).coerceAtLeast(1) * 1000.0)
+        lastStatsAt = now; lastBytes = bytesWritten
+        RecorderState.updateStats(bytesWritten, imuCount, tracker.hz, mbps)
         val text = "Rec %s · %d samples · %.0f Hz · %s".format(
             dir.name.removePrefix("spc2_"), imuCount, tracker.hz, bytesWritten.humanBytes())
         updateNotification(text)
@@ -235,15 +285,30 @@ class RecordingService : LifecycleService() {
 
     companion object {
         const val EXTRA_DEVICE = "usb_device"
+        const val ACTION_DEVICE_ATTACHED = "com.mercurylabs.headspace.DEVICE_ATTACHED"
+        const val ACTION_START_RECORDING = "com.mercurylabs.headspace.START"
+        const val ACTION_STOP_RECORDING  = "com.mercurylabs.headspace.STOP"
         private const val CH_ID = "rec"
         private const val NOTIF_ID = 1
         private const val TAG = "RecordingService"
 
+        /** Hand the service a freshly-attached UsbDevice. The service will
+         *  hold it in DEVICE_READY state, NOT auto-start recording — the
+         *  user has to tap the big START button. */
         fun start(ctx: Context, device: UsbDevice) {
-            val i = Intent(ctx, RecordingService::class.java).apply {
-                putExtra(EXTRA_DEVICE, device)
-            }
+            val i = Intent(ctx, RecordingService::class.java)
+                .setAction(ACTION_DEVICE_ATTACHED)
+                .putExtra(EXTRA_DEVICE, device)
             ctx.startForegroundService(i)
+        }
+
+        fun startRecording(ctx: Context) {
+            ctx.startForegroundService(
+                Intent(ctx, RecordingService::class.java).setAction(ACTION_START_RECORDING))
+        }
+        fun stopRecording(ctx: Context) {
+            ctx.startForegroundService(
+                Intent(ctx, RecordingService::class.java).setAction(ACTION_STOP_RECORDING))
         }
     }
 }

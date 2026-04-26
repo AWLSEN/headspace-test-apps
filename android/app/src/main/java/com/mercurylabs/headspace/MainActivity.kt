@@ -21,10 +21,17 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import androidx.compose.foundation.background
 import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.draw.clip
 import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -205,9 +212,14 @@ private fun App(
     onOpenDiagnostics: () -> Unit,
 ) {
     val ctx = LocalContext.current
+    val rec by RecorderState.state.collectAsState()
     var recordings by remember { mutableStateOf(Recordings.list(ctx)) }
-    // Refresh the list whenever the activity resumes (e.g. after recording stops).
-    LaunchedEffect(Unit) { recordings = Recordings.list(ctx) }
+    // Refresh the saved-list whenever recording phase changes back to idle/ready.
+    LaunchedEffect(rec.phase) {
+        if (rec.phase != RecorderState.Phase.RECORDING) {
+            recordings = Recordings.list(ctx)
+        }
+    }
 
     MaterialTheme {
         @OptIn(ExperimentalMaterial3Api::class)
@@ -222,17 +234,33 @@ private fun App(
                         IconButton(onClick = onOpenWifiSetup) {
                             Icon(Icons.Filled.Wifi, contentDescription = "WiFi setup")
                         }
-                        IconButton(onClick = { recordings = Recordings.list(ctx) }) {
-                            Icon(Icons.Filled.Folder, contentDescription = "Refresh")
-                        }
                     },
                 )
             }
         ) { padding ->
             Column(Modifier.padding(padding).fillMaxSize()) {
-                StatusCard()
+                BigButtonPanel(
+                    state = rec,
+                    onStart = { RecordingService.startRecording(ctx) },
+                    onStop  = { RecordingService.stopRecording(ctx)  },
+                )
+                rec.lastError?.let { err ->
+                    Surface(
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                    ) {
+                        Text("⚠ $err", Modifier.padding(12.dp),
+                             color = MaterialTheme.colorScheme.onErrorContainer,
+                             fontSize = 13.sp)
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text("Past recordings", Modifier.padding(start = 16.dp, top = 8.dp),
+                     style = MaterialTheme.typography.titleMedium)
                 if (recordings.isEmpty()) {
-                    EmptyState()
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text("No recordings yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 } else {
                     LazyColumn(Modifier.fillMaxSize()) {
                         items(recordings, key = { it.name }) { r ->
@@ -247,46 +275,120 @@ private fun App(
 }
 
 @Composable
-private fun StatusCard() {
+private fun BigButtonPanel(
+    state: RecorderState.Snapshot,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+) {
+    val ready    = state.phase == RecorderState.Phase.DEVICE_READY
+    val recording = state.phase == RecorderState.Phase.RECORDING
+    val idle     = state.phase == RecorderState.Phase.IDLE
+
     Surface(
         modifier = Modifier.fillMaxWidth().padding(16.dp),
-        shape = RoundedCornerShape(12.dp),
-        tonalElevation = 2.dp,
+        shape = RoundedCornerShape(16.dp),
+        tonalElevation = 4.dp,
+        color = when {
+            recording -> MaterialTheme.colorScheme.errorContainer
+            ready     -> MaterialTheme.colorScheme.primaryContainer
+            else      -> MaterialTheme.colorScheme.surfaceVariant
+        },
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(16.dp),
+        Column(
+            Modifier.padding(20.dp).fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Icon(
-                Icons.Filled.FiberManualRecord,
-                contentDescription = null,
-                tint = Color(0xFFE53935),
+            // STATUS LINE
+            val statusText = when {
+                recording -> "● Recording — ${state.deviceName}"
+                ready     -> "● Connected — ${state.deviceName}"
+                else      -> "○ Plug in the Headspace SPC2"
+            }
+            Text(statusText, fontWeight = FontWeight.SemiBold,
+                 fontSize = 16.sp, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                when {
+                    recording -> "%.1f Mbps · %d IMU samples (%.0f Hz) · %s".format(
+                        state.mbps, state.imuSamples, state.imuHz,
+                        state.bytesWritten.humanBytes())
+                    ready     -> "Tap RECORD when you're ready"
+                    else      -> "Recording starts after you tap RECORD"
+                },
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center,
             )
-            Spacer(Modifier.width(12.dp))
-            Column {
-                Text("Plug in the Headspace SPC2", fontWeight = FontWeight.SemiBold)
-                Text(
-                    "Recording starts automatically · saves to app folder",
-                    style = MaterialTheme.typography.bodySmall,
-                )
+
+            Spacer(Modifier.height(20.dp))
+
+            // BIG BUTTON
+            if (recording) {
+                Button(
+                    onClick = onStop,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error),
+                    modifier = Modifier.fillMaxWidth().height(72.dp),
+                    shape = RoundedCornerShape(36.dp),
+                ) {
+                    Icon(Icons.Filled.Stop, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("STOP", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                }
+            } else {
+                Button(
+                    onClick = onStart,
+                    enabled = ready,
+                    modifier = Modifier.fillMaxWidth().height(72.dp),
+                    shape = RoundedCornerShape(36.dp),
+                ) {
+                    Icon(Icons.Filled.FiberManualRecord,
+                         contentDescription = null,
+                         tint = if (ready) Color(0xFFE53935) else Color.Unspecified)
+                    Spacer(Modifier.width(8.dp))
+                    Text(if (ready) "RECORD" else "WAITING FOR DEVICE",
+                         fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+            if (recording) {
+                Spacer(Modifier.height(8.dp))
+                Text(state.sessionName,
+                     fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                Spacer(Modifier.height(12.dp))
+                // Live preview — 16:9 SurfaceView feeds RecorderState.previewSurface
+                Surface(
+                    color = Color.Black,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(16f / 9f)
+                        .clip(RoundedCornerShape(8.dp)),
+                ) {
+                    PreviewSurface()
+                }
             }
         }
     }
 }
 
 @Composable
-private fun EmptyState() {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("No recordings yet", style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "Connect the camera via USB-OTG to start.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
+private fun PreviewSurface() {
+    AndroidView(
+        factory = { ctx ->
+            SurfaceView(ctx).apply {
+                holder.addCallback(object : SurfaceHolder.Callback {
+                    override fun surfaceCreated(h: SurfaceHolder) {
+                        RecorderState.previewSurface = h.surface
+                    }
+                    override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {
+                        RecorderState.previewSurface = h.surface
+                    }
+                    override fun surfaceDestroyed(h: SurfaceHolder) {
+                        RecorderState.previewSurface = null
+                    }
+                })
+            }
+        },
+        modifier = Modifier.fillMaxSize(),
+    )
 }
 
 @Composable

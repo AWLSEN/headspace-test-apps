@@ -116,29 +116,22 @@ class UvcCamera(
         Log.i(TAG, streamInfo)
         CrashLog.line(ctx, TAG, streamInfo)
 
-        // Claim the interface BEFORE setInterface — Android API requirement.
+        // Claim the data-carrying alt=1 directly. Tried doing probe on
+        // alt=0 first (per UVC spec), but Android's setInterface(alt=1)
+        // returns false after a class-control transfer on the same iface,
+        // and we end up stuck on alt=0. Mediatek phones reject probe/
+        // commit no matter what we do — so we just send the controls
+        // anyway, log the rejection, and let the gadget stream with its
+        // configfs defaults (which is exactly what we want anyway).
         if (!openConn.claimInterface(bestIface, true)) {
             onError("claimInterface failed"); release(); return
         }
         iface = bestIface
+        // Tell Android+device about the alt switch.
+        val setAlt = openConn.setInterface(bestIface)
+        CrashLog.line(ctx, TAG, "setInterface(alt=${bestIface.alternateSetting})=$setAlt")
 
-        // CRITICAL: when the streaming interface has multiple alt settings
-        // (alt=0 zero-bandwidth + alt=1 data-carrying), claimInterface alone
-        // leaves Android pointing at alt=0. We MUST call setInterface() so
-        // both Android's internal state AND the device switch to alt=1.
-        // Without this, UsbRequest.initialize() looks up the endpoint on
-        // alt=0 (which has zero endpoints) and returns false — exactly the
-        // crash we saw on the first field test.
-        if (bestIface.alternateSetting != 0) {
-            val ok = openConn.setInterface(bestIface)
-            CrashLog.line(ctx, TAG, "setInterface(alt=${bestIface.alternateSetting})=$ok")
-            if (!ok) {
-                onError("setInterface(alt=${bestIface.alternateSetting}) failed")
-                release(); return
-            }
-        }
-
-        // ---- 2-4. Probe / commit -----------------------------------------
+        // ---- Probe / commit (best-effort, ignored if rejected) -----------
         // Format index 1, frame index 1, 30 fps (333333 × 100ns). These are
         // the values our gadget exposes via configfs.
         val probe = UvcControl.buildProbe(
@@ -187,11 +180,14 @@ class UvcCamera(
             Log.w(TAG, "SET_CUR(commit) wrote $commitRc/${commitPayload.size}")
         }
 
-        // ---- 5. SET_INTERFACE — switch to the data-carrying alt ---------
-        // Android's UsbDeviceConnection has setInterface() but it actually
-        // does claimInterface again on the *new* alt setting. The official
-        // way to switch alt is via controlTransfer SET_INTERFACE.
-        // Reference: USB 2.0 spec 9.4.10.
+        // ---- NOW switch to data-carrying alt to start streaming ---------
+        // Use the high-level setInterface(UsbInterface) so Android's USB
+        // layer's endpoint table updates too — without that, subsequent
+        // bulk reads look up the wrong endpoint (we found this earlier).
+        val setIfaceOK = openConn.setInterface(bestIface)
+        CrashLog.line(ctx, TAG, "setInterface(alt=${bestIface.alternateSetting})=$setIfaceOK")
+        // Belt-and-suspenders: also send the standard SET_INTERFACE
+        // control transfer in case some USB stacks need it explicit.
         val setIfaceRc = openConn.controlTransfer(
             0x01,                                 // bmReqType: standard, interface
             0x0B,                                 // bRequest: SET_INTERFACE
@@ -200,7 +196,7 @@ class UvcCamera(
             null, 0, CTRL_TIMEOUT_MS,
         )
         if (setIfaceRc < 0) {
-            Log.w(TAG, "SET_INTERFACE returned $setIfaceRc (alt=${bestIface.alternateSetting})")
+            Log.w(TAG, "SET_INTERFACE control returned $setIfaceRc (alt=${bestIface.alternateSetting})")
         } else {
             Log.i(TAG, "SET_INTERFACE alt=${bestIface.alternateSetting} OK")
         }
@@ -240,32 +236,103 @@ class UvcCamera(
         return false
     }
 
-    // Bulk path — synchronous bulkTransfer. The Pi UVC gadget streams H.264
-    // over a bulk endpoint, which is what bulkTransfer is built for. Avoids
-    // UsbRequest.initialize, which intermittently returns false right after
-    // an alt-setting switch on Android 14+.
+    // Bulk path — async UsbRequest with multiple in-flight reads.
+    // Synchronous bulkTransfer caps throughput at ~one packet per
+    // round-trip (~30 ms × 64 B ≈ 2 KB/s) which is way below the bus's
+    // capability. With async UsbRequest we keep N reads queued at any
+    // moment so the kernel can drain back-to-back packets without
+    // waiting for usermode in between.
     private fun bulkReaderLoop(c: UsbDeviceConnection, ep: UsbEndpoint, maxPayload: Int) {
-        val readSize = if (maxPayload in 1..(256 * 1024)) maxPayload else 64 * 1024
-        val buf = ByteArray(readSize)
+        val mps = ep.maxPacketSize.coerceAtLeast(64)
+        // Each request reads up to 16 packets — gives the kernel room to
+        // batch when the gadget sends data fast.
+        val readSize = mps * 16
+        val IN_FLIGHT = 4
+        val pool = ArrayList<UsbRequest>(IN_FLIGHT)
+        val buffers = HashMap<UsbRequest, ByteBuffer>()
+        for (i in 0 until IN_FLIGHT) {
+            val r = UsbRequest()
+            if (!r.initialize(c, ep)) {
+                CrashLog.line(ctx, TAG,
+                    "UsbRequest.initialize #$i FAILED on bulk ep — falling back to sync")
+                // Tear down any we did make
+                for (rr in pool) rr.close()
+                bulkReaderLoopSync(c, ep, maxPayload)
+                return
+            }
+            pool.add(r)
+            buffers[r] = ByteBuffer.allocate(readSize)
+        }
+        // Prime: queue all four
+        for (r in pool) {
+            val b = buffers[r]!!
+            b.clear()
+            r.queue(b, readSize)
+        }
+        CrashLog.line(ctx, TAG, "async bulk reader: $IN_FLIGHT reqs × $readSize B in flight")
+
+        var totalBytes = 0L
+        var lastReport = System.currentTimeMillis()
         var idleSince = System.currentTimeMillis()
-        var consecutiveErrors = 0
         while (running) {
-            val n = c.bulkTransfer(ep, buf, buf.size, 500)
-            if (n < 0) {
-                consecutiveErrors++
-                if (System.currentTimeMillis() - idleSince > 2000) {
-                    Log.w(TAG, "no UVC packets in 2s (bulkTransfer=$n)")
-                    idleSince = System.currentTimeMillis()
+            val done = c.requestWait(200) ?: continue
+            val b = buffers[done]
+            val n = b?.position() ?: 0
+            if (n > 0) {
+                idleSince = System.currentTimeMillis()
+                totalBytes += n
+                val arr = ByteArray(n)
+                b!!.rewind(); b.get(arr, 0, n)
+                onFrame(arr, 0, n)
+                if (System.currentTimeMillis() - lastReport >= 5000) {
+                    val mbps = (totalBytes * 8.0) /
+                        ((System.currentTimeMillis() - lastReport) * 1000.0)
+                    CrashLog.line(ctx, TAG, "bulk reader: %.2f Mbps".format(mbps))
+                    totalBytes = 0; lastReport = System.currentTimeMillis()
                 }
-                if (consecutiveErrors > 200) {
-                    onError("bulkTransfer kept failing — device unplugged?"); break
+            } else if (System.currentTimeMillis() - idleSince > 2000) {
+                CrashLog.line(ctx, TAG, "no bulk data in 2s (n=$n)")
+                idleSince = System.currentTimeMillis()
+            }
+            // Re-queue this request immediately
+            if (b != null) {
+                b.clear()
+                done.queue(b, readSize)
+            }
+        }
+        for (r in pool) try { r.close() } catch (_: Throwable) {}
+    }
+
+    /** Fallback synchronous path when UsbRequest.initialize fails (which
+     *  happens on some Mediatek phones for iso eps but should rarely fire
+     *  for bulk). Reads exactly maxPacket per call so short-packet
+     *  early-termination doesn't waste round-trips. */
+    private fun bulkReaderLoopSync(c: UsbDeviceConnection, ep: UsbEndpoint, maxPayload: Int) {
+        val mps = ep.maxPacketSize.coerceAtLeast(64)
+        val buf = ByteArray(mps)
+        var idleSince = System.currentTimeMillis()
+        var totalBytes = 0L
+        var lastReport = System.currentTimeMillis()
+        CrashLog.line(ctx, TAG, "bulkReaderLoopSync start mps=$mps")
+        while (running) {
+            val n = c.bulkTransfer(ep, buf, buf.size, 200)
+            if (n < 0) {
+                if (System.currentTimeMillis() - idleSince > 2000) {
+                    CrashLog.line(ctx, TAG, "sync bulk: no data in 2s (rc=$n)")
+                    idleSince = System.currentTimeMillis()
                 }
                 continue
             }
-            consecutiveErrors = 0
             if (n > 0) {
                 idleSince = System.currentTimeMillis()
+                totalBytes += n
                 onFrame(buf, 0, n)
+                if (System.currentTimeMillis() - lastReport >= 5000) {
+                    val mbps = (totalBytes * 8.0) /
+                        ((System.currentTimeMillis() - lastReport) * 1000.0)
+                    CrashLog.line(ctx, TAG, "sync bulk reader: %.2f Mbps".format(mbps))
+                    totalBytes = 0; lastReport = System.currentTimeMillis()
+                }
             }
         }
     }

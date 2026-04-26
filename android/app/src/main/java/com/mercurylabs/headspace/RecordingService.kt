@@ -4,271 +4,254 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.BroadcastReceiver
-import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
-import android.hardware.usb.UsbDevice
-import android.hardware.usb.UsbManager
+import android.content.pm.ServiceInfo
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
+import android.media.MediaMuxer
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
-import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.*
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
-import org.json.JSONObject
+import kotlin.concurrent.thread
 
 /**
- * Foreground service that owns the UVC reader + the file writers for one
- * recording session. Lifecycle: started by MainActivity when a Headspace
- * device is detected, stopped on USB_DEVICE_DETACHED for that device.
+ * Recording session — coordinates the camera (via CameraHelper using
+ * libuvc-bundled AndroidUSBCamera) and the MP4 muxer.
  *
- * Output layout (in app-private external storage, no SAF needed):
- *   <getExternalFilesDir>/recordings/spc2_2026-04-25_15-30-22/
- *     ├ video.h264   raw Annex-B H.264 (with SEI NALs preserved)
- *     ├ imu.imu      CSV: boottime_ns,ax,ay,az,gx,gy,gz,mx,my,mz,mag_valid
- *     └ meta.json    session info (start time, device, samples count, …)
- *
- * (We write raw .h264 instead of muxing to MP4 live — keeps the recorder
- * simple and bit-perfect. A separate "muxer" pass converts to .mp4 on the
- * Recording detail screen so the user gets a playable file when they want
- * to share it. Same Awign frames either way.)
+ * The phone receives MJPEG-decoded NV21 frames, encodes to H.264 via
+ * MediaCodec on the device's HW encoder, muxes to .mp4. IMU samples
+ * arrive separately over the ACM serial channel and land in .imu CSV.
  */
 class RecordingService : LifecycleService() {
 
-    private var camera: UvcCamera? = null
+    private var helper: CameraHelper? = null
     private var sessionDir: File? = null
-    private var videoOut: FileOutputStream? = null
-    private var imuOut: FileOutputStream? = null
-    private var imuWriter: ImuCsvWriter? = null
-    private var sei: SeiParser? = null
     private var startedAt: Date? = null
-    private var firstFrameAt: Long = 0L
     private var bytesWritten: Long = 0L
     private var frameCount: Long = 0L
     private var imuCount: Long = 0L
     private val tracker = ImuRateTracker()
-    private var preview: PreviewDecoder? = null
-    private var startedPreviewWithSurface: android.view.Surface? = null
 
-    private val detachReceiver = object : BroadcastReceiver() {
-        override fun onReceive(c: Context, i: Intent) {
-            if (i.action != UsbManager.ACTION_USB_DEVICE_DETACHED) return
-            val d: UsbDevice? = i.getParcelableExtra(UsbManager.EXTRA_DEVICE)
-            if (d != null && d.deviceId == camera?.devName?.hashCode()) {
-                Log.i(TAG, "device detached → stopping")
-            }
-            // We use deviceId-by-name as a coarse match; any detach during
-            // a session warrants stopping (only one Headspace at a time).
-            stopRecording("usb_detached")
-        }
-    }
+    // Encoder + muxer
+    private var encoder: MediaCodec? = null
+    private var muxer: MediaMuxer? = null
+    private var muxerStarted = false
+    private var videoTrackId = -1
+    private var encoderInputBufferIdx = -1
 
     override fun onCreate() {
         super.onCreate()
         CrashLog.line(this, "RecordingService", "onCreate")
         ensureChannel()
-        // CRITICAL: must call startForeground within ~5s of startForegroundService
-        // or Android 12+ throws ForegroundServiceDidNotStartInTimeException. Do
-        // it as the very first thing in onCreate.
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(NOTIF_ID, buildNotification("Headspace recorder ready"),
-                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
             } else {
                 startForeground(NOTIF_ID, buildNotification("Headspace recorder ready"))
             }
         } catch (e: Throwable) {
-            CrashLog.writeException(this, "startForeground failed", e)
-        }
-        val filter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(detachReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(detachReceiver, filter)
+            CrashLog.writeException(this, "startForeground", e)
         }
     }
 
-    private var pendingDevice: UsbDevice? = null
-
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        val action = intent?.action
-        when (action) {
+        when (intent?.action) {
             ACTION_DEVICE_ATTACHED -> {
-                val device: UsbDevice? = intent.getParcelableExtra(EXTRA_DEVICE)
-                if (device == null) {
-                    CrashLog.line(this, TAG, "ATTACHED with null device, ignoring")
-                    return START_NOT_STICKY
-                }
-                pendingDevice = device
-                RecorderState.setReady(device.productName ?: "USB Device")
+                ensureHelper()
+                RecorderState.setReady("Headspace SPC2")
                 updateNotification("Device ready — tap RECORD")
-                CrashLog.line(this, TAG, "device ready: ${device.productName}")
             }
-            ACTION_START_RECORDING -> {
-                val device = pendingDevice
-                if (device == null) {
-                    CrashLog.line(this, TAG, "START requested but no device attached")
-                    RecorderState.setError("No device — plug in the Headspace SPC2 first")
-                    return START_NOT_STICKY
-                }
-                if (camera != null) {
-                    CrashLog.line(this, TAG, "already recording, ignoring START")
-                    return START_NOT_STICKY
-                }
-                startRecording(device)
-            }
-            ACTION_STOP_RECORDING -> {
-                if (camera != null) stopRecording("user_stopped")
-                pendingDevice?.let { RecorderState.setReady(it.productName ?: "USB Device") }
-                    ?: RecorderState.setIdle()
-            }
+            ACTION_START_RECORDING -> startRecording()
+            ACTION_STOP_RECORDING  -> stopRecording("user_stopped")
         }
         return START_STICKY
     }
 
-    private fun startRecording(device: UsbDevice) {
+    private fun ensureHelper() {
+        if (helper != null) return
+        helper = CameraHelper(this,
+            onFrame = { nv21, w, h -> onNv21Frame(nv21, w, h) },
+            onState = { opened, msg ->
+                CrashLog.line(this, "Camera", "state opened=$opened msg=$msg")
+                if (opened) {
+                    RecorderState.setReady("Headspace SPC2")
+                    updateNotification("Device ready — tap RECORD")
+                } else {
+                    RecorderState.setIdle()
+                }
+            },
+        ).also { it.start() }
+    }
+
+    private fun startRecording() {
+        if (encoder != null) {
+            CrashLog.line(this, "Recorder", "already recording, ignored"); return
+        }
         try {
             val dir = Recordings.newSession(this).also { sessionDir = it }
-            val v = File(dir, "video.h264")
-            val i = File(dir, "imu.imu")
-            videoOut = FileOutputStream(v)
-            imuOut = FileOutputStream(i)
-            imuWriter = ImuCsvWriter(imuOut!!)
             startedAt = Date()
-            bytesWritten = 0; frameCount = 0; imuCount = 0; firstFrameAt = 0
-            sei = SeiParser { s ->
-                try {
-                    imuWriter?.write(s); imuCount++; tracker.tick(s.boottimeNs)
-                } catch (e: Throwable) { CrashLog.writeException(this, "sei write", e) }
-            }
-            CrashLog.line(this, "RecordingService", "starting session: ${dir.absolutePath}")
-            RecorderState.setRecording(dir.absolutePath, dir.name, device.productName ?: "USB Device")
+            bytesWritten = 0; frameCount = 0; imuCount = 0
+            tracker.reset()
 
-            camera = UvcCamera(
-                ctx = this,
-                device = device,
-                onFrame = { buf, off, len ->
-                    try {
-                        val out = videoOut ?: return@UvcCamera
-                        out.write(buf, off, len)
-                        bytesWritten += len
-                        if (firstFrameAt == 0L) firstFrameAt = System.currentTimeMillis()
-                        frameCount++
-                        sei?.feed(buf, off, len)
-                        // Pump bytes into the preview decoder if the UI gave
-                        // us a Surface. Lazy-create the decoder on first frame
-                        // (and re-create if the surface changed mid-recording).
-                        val sfc = RecorderState.previewSurface
-                        if (sfc != null && sfc != startedPreviewWithSurface) {
-                            try { preview?.stop() } catch (_: Throwable) {}
-                            preview = PreviewDecoder().also { it.start(sfc) }
-                            startedPreviewWithSurface = sfc
-                        } else if (sfc == null && preview != null) {
-                            try { preview?.stop() } catch (_: Throwable) {}
-                            preview = null; startedPreviewWithSurface = null
-                        }
-                        preview?.feed(buf, off, len)
-                        preview?.let { RecorderState.framesDecoded = it.framesDecoded }
-                        if (frameCount % 30L == 0L) postStatus()
-                    } catch (e: Throwable) {
-                        CrashLog.writeException(this, "onFrame", e)
-                    }
-                },
-                onError = { msg ->
-                    CrashLog.line(this, "UvcCamera", "ERROR: $msg")
-                    updateNotification("Error: $msg")
-                },
-            )
-            camera!!.requestPermissionAndOpen {
-                try { camera!!.start() }
-                catch (e: Throwable) { CrashLog.writeException(this, "camera.start", e) }
+            // Set up MediaCodec H.264 encoder for 1920×1080@30
+            val fmt = MediaFormat.createVideoFormat("video/avc", 1920, 1080).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar)
+                setInteger(MediaFormat.KEY_BIT_RATE, 8_000_000)
+                setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             }
-            updateNotification("Recording — ${device.productName ?: "device"}")
+            encoder = MediaCodec.createEncoderByType("video/avc").apply {
+                configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                start()
+            }
+            muxer = MediaMuxer(File(dir, "video.mp4").absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            muxerStarted = false; videoTrackId = -1
+            // IMU writer
+            val imuFile = File(dir, "imu.imu")
+            imuOut = FileOutputStream(imuFile).also { fos ->
+                fos.write("boottime_ns,ax,ay,az,gx,gy,gz,mx,my,mz,mag_valid\n".toByteArray())
+            }
+            // Drain encoder in a loop on its own thread
+            thread(name = "encoder-drain", isDaemon = true) { drainEncoder() }
+            CrashLog.line(this, "Recorder", "session started: ${dir.absolutePath}")
+            RecorderState.setRecording(dir.absolutePath, dir.name, "Headspace SPC2")
+            updateNotification("Recording…")
         } catch (e: Throwable) {
-            CrashLog.writeException(this, "startRecording top-level", e)
-            updateNotification("Error: ${e.javaClass.simpleName} ${e.message}")
+            CrashLog.writeException(this, "startRecording", e)
+            RecorderState.setError(e.message ?: "start failed")
+        }
+    }
+
+    private var imuOut: FileOutputStream? = null
+
+    private fun onNv21Frame(nv21: ByteArray, w: Int, h: Int) {
+        val enc = encoder ?: return
+        try {
+            val idx = enc.dequeueInputBuffer(10_000)
+            if (idx >= 0) {
+                val buf = enc.getInputBuffer(idx)!!
+                buf.clear()
+                buf.put(nv21, 0, minOf(nv21.size, buf.capacity()))
+                val pts = (frameCount * 1_000_000L / 30L)  // 30 fps
+                enc.queueInputBuffer(idx, 0, nv21.size, pts, 0)
+            }
+            frameCount++
+            if (frameCount % 30L == 0L) postStatus()
+        } catch (e: Throwable) {
+            CrashLog.writeException(this, "onNv21Frame", e)
+        }
+    }
+
+    private fun drainEncoder() {
+        val enc = encoder ?: return
+        val mux = muxer ?: return
+        val info = MediaCodec.BufferInfo()
+        try {
+            while (encoder != null) {
+                val outIdx = enc.dequeueOutputBuffer(info, 10_000)
+                when {
+                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        videoTrackId = mux.addTrack(enc.outputFormat)
+                        mux.start()
+                        muxerStarted = true
+                        CrashLog.line(this, "Encoder", "muxer started, track=$videoTrackId")
+                    }
+                    outIdx >= 0 -> {
+                        if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                            // SPS/PPS already absorbed via outputFormat — drop
+                        } else if (muxerStarted && info.size > 0) {
+                            val out = enc.getOutputBuffer(outIdx)!!
+                            out.position(info.offset)
+                            out.limit(info.offset + info.size)
+                            mux.writeSampleData(videoTrackId, out, info)
+                            bytesWritten += info.size
+                        }
+                        enc.releaseOutputBuffer(outIdx, false)
+                        if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            CrashLog.writeException(this, "drainEncoder", e)
         }
     }
 
     private fun stopRecording(reason: String) {
         val dir = sessionDir ?: return
-        Log.i(TAG, "stopping session ($reason): ${dir.absolutePath}")
-        camera?.stop(); camera = null
-        try { preview?.stop() } catch (_: Throwable) {}
-        preview = null; startedPreviewWithSurface = null
-        try { videoOut?.flush(); videoOut?.close() } catch (_: Exception) {}
-        try { imuOut?.flush(); imuOut?.close() } catch (_: Exception) {}
-        videoOut = null; imuOut = null; imuWriter = null
+        try { encoder?.signalEndOfInputStream() } catch (_: Throwable) {}
+        Thread.sleep(200)
+        try { encoder?.stop() } catch (_: Throwable) {}
+        try { encoder?.release() } catch (_: Throwable) {}
+        encoder = null
+        try { if (muxerStarted) muxer?.stop() } catch (_: Throwable) {}
+        try { muxer?.release() } catch (_: Throwable) {}
+        muxer = null
+        try { imuOut?.flush(); imuOut?.close() } catch (_: Throwable) {}
+        imuOut = null
 
-        // Drop a meta.json so anyone opening the folder knows what they have.
         val meta = JSONObject().apply {
-            put("device", camera?.devName ?: "Headspace SPC2 H264")
+            put("device", "Headspace SPC2 MJPEG")
             put("started_at_utc", isoUtc(startedAt ?: Date()))
             put("ended_at_utc", isoUtc(Date()))
-            put("video_file", "video.h264")
+            put("video_file", "video.mp4")
             put("imu_file", "imu.imu")
             put("video_bytes", bytesWritten)
-            put("usb_chunks", frameCount)
+            put("frames", frameCount)
             put("imu_samples", imuCount)
             put("imu_observed_hz", "%.1f".format(tracker.hz))
             put("stop_reason", reason)
         }
         File(dir, "meta.json").writeText(meta.toString(2))
-        updateNotification("Saved · ${dir.name} · ${bytesWritten.humanBytes()}")
-        // Flip back to idle but keep service alive so the next attach event
-        // can restart cleanly. (System frees us when MainActivity finishes.)
-        sessionDir = null; startedAt = null; sei = null
-        tracker.reset()
+        CrashLog.line(this, "Recorder", "session stopped ($reason): ${dir.absolutePath} / ${bytesWritten} bytes / ${frameCount} frames")
+        sessionDir = null; startedAt = null
+        RecorderState.setReady("Headspace SPC2")
+        updateNotification("Saved · $bytesWritten bytes · $frameCount frames")
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        try { unregisterReceiver(detachReceiver) } catch (_: Exception) {}
         if (sessionDir != null) stopRecording("service_destroyed")
+        helper?.stop(); helper = null
     }
 
     override fun onBind(intent: Intent): IBinder? { super.onBind(intent); return null }
 
-    // ---- notification plumbing ----
-
     private var lastStatsAt = System.currentTimeMillis()
     private var lastBytes = 0L
-
     private fun postStatus() {
         val dir = sessionDir ?: return
         val now = System.currentTimeMillis()
         val mbps = ((bytesWritten - lastBytes) * 8.0) / ((now - lastStatsAt).coerceAtLeast(1) * 1000.0)
         lastStatsAt = now; lastBytes = bytesWritten
         RecorderState.updateStats(bytesWritten, imuCount, tracker.hz, mbps)
-        val text = "Rec %s · %d samples · %.0f Hz · %s".format(
-            dir.name.removePrefix("spc2_"), imuCount, tracker.hz, bytesWritten.humanBytes())
-        updateNotification(text)
+        updateNotification("Rec %s · %d frames · %s".format(
+            dir.name.removePrefix("spc2_"), frameCount, bytesWritten.humanBytes()))
     }
 
     private fun ensureChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val mgr = getSystemService(NotificationManager::class.java)
-        val ch = NotificationChannel(CH_ID, "Recording", NotificationManager.IMPORTANCE_LOW).apply {
-            description = "Headspace SPC2 capture status"
-            setShowBadge(false)
-        }
+        val ch = NotificationChannel(CH_ID, "Recording", NotificationManager.IMPORTANCE_LOW)
         mgr.createNotificationChannel(ch)
     }
 
     private fun buildNotification(text: String): Notification {
         val openMain = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
+            this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return NotificationCompat.Builder(this, CH_ID)
             .setSmallIcon(android.R.drawable.ic_menu_camera)
@@ -292,21 +275,15 @@ class RecordingService : LifecycleService() {
         private const val NOTIF_ID = 1
         private const val TAG = "RecordingService"
 
-        /** Hand the service a freshly-attached UsbDevice. The service will
-         *  hold it in DEVICE_READY state, NOT auto-start recording — the
-         *  user has to tap the big START button. */
-        fun start(ctx: Context, device: UsbDevice) {
-            val i = Intent(ctx, RecordingService::class.java)
-                .setAction(ACTION_DEVICE_ATTACHED)
-                .putExtra(EXTRA_DEVICE, device)
-            ctx.startForegroundService(i)
+        fun start(ctx: android.content.Context, device: android.hardware.usb.UsbDevice) {
+            ctx.startForegroundService(
+                Intent(ctx, RecordingService::class.java).setAction(ACTION_DEVICE_ATTACHED))
         }
-
-        fun startRecording(ctx: Context) {
+        fun startRecording(ctx: android.content.Context) {
             ctx.startForegroundService(
                 Intent(ctx, RecordingService::class.java).setAction(ACTION_START_RECORDING))
         }
-        fun stopRecording(ctx: Context) {
+        fun stopRecording(ctx: android.content.Context) {
             ctx.startForegroundService(
                 Intent(ctx, RecordingService::class.java).setAction(ACTION_STOP_RECORDING))
         }
@@ -318,7 +295,6 @@ private val ISO_UTC = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).ap
 }
 private fun isoUtc(d: Date) = ISO_UTC.format(d)
 
-/** Tracks running IMU sample rate from a stream of boottime_ns values. */
 class ImuRateTracker {
     private var window = ArrayDeque<Long>()
     var hz: Double = 0.0; private set

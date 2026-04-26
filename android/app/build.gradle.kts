@@ -10,7 +10,11 @@ android {
     defaultConfig {
         applicationId = "com.mercurylabs.headspace"
         minSdk = 24       // Android 7.0 — covers ~99% of devices and has UsbManager
-        targetSdk = 34
+        // targetSdk 33 NOT 34: the AndroidUSBCamera library calls
+        // registerReceiver without RECEIVER_EXPORTED/_NOT_EXPORTED, which
+        // throws on targetSdk 34+ on Android 14 devices. Targeting 33
+        // grandfathers us into the lenient behavior.
+        targetSdk = 33
         versionCode = 1
         versionName = "0.1.0"
     }
@@ -66,4 +70,18 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")
+
+    // AndroidUSBCamera: bundles libusb + libuvc, bypasses Android's USB API
+    // (the broken Mediatek class-control transfers). Fragment-based, gives
+    // raw frame callbacks via IFrameCallback.
+    // 3.2.7 — last version where all sub-artifacts (libuvc, libnative,
+    // libutils, libuvccommon) were actually published to JitPack. Newer
+    // tags forgot to publish libuvc.
+    implementation("com.github.jiangdongguo.AndroidUSBCamera:libausbc:3.2.7")
+    // Sub-modules needed for direct API use (USBMonitor, frame callbacks).
+    // libausbc declares these as `api` in its POM but Kotlin still needs
+    // them on the compile classpath explicitly.
+    implementation("com.github.jiangdongguo.AndroidUSBCamera:libuvc:3.2.7")
+    implementation("com.github.jiangdongguo.AndroidUSBCamera:libuvccommon:3.2.7")
+    implementation("com.github.jiangdongguo.AndroidUSBCamera:libnative:3.2.7")
 }

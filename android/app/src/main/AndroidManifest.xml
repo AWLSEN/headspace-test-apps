@@ -38,7 +38,7 @@
 
         <service
             android:name=".RecordingService"
-            android:exported="false"
+            android:exported="true"
             android:foregroundServiceType="camera"/>
 
     </application>

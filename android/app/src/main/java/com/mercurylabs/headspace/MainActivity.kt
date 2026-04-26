@@ -10,6 +10,10 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -40,6 +44,14 @@ class MainActivity : ComponentActivity() {
 
     private val notifPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* ignored */ }
+
+    /** Devices we've already fired the recording service for. Keyed by
+     *  device.deviceId (kernel-assigned per-attach, changes on replug).
+     *  Cleared when the device detaches via the broadcast in
+     *  RecordingService — but we also drop entries whose device disappears
+     *  from the live list, so a quick unplug-replug recovers cleanly. */
+    private val handledDeviceIds = mutableSetOf<Int>()
+    private var pollJob: Job? = null
 
     // Android 14+ requires CAMERA runtime grant before we can start a
     // foreground service of type "camera". Without it, startForeground
@@ -84,6 +96,54 @@ class MainActivity : ComponentActivity() {
         handleUsbAttach(intent)
     }
 
+    override fun onResume() {
+        super.onResume()
+        // 1. One-shot: catch the case where the device was ALREADY plugged
+        //    in when the app launched (the system only fires
+        //    USB_DEVICE_ATTACHED on the *transition*, not for already-
+        //    attached devices). Without this, plugging the phone into the
+        //    Pi while the Pi is still booting leaves the app sitting at
+        //    the empty state forever, even after the Pi enumerates.
+        // 2. Continuous poll: covers the boot-race scenario — phone
+        //    plugged in BEFORE Pi finishes booting; we'll catch the
+        //    enumeration the moment it completes.
+        pollJob?.cancel()
+        pollJob = lifecycleScope.launch {
+            while (true) {
+                checkForAttachedDevice()
+                delay(2_000)
+            }
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        pollJob?.cancel(); pollJob = null
+    }
+
+    private fun checkForAttachedDevice() {
+        val mgr = getSystemService(USB_SERVICE) as UsbManager
+        val live = mgr.deviceList.values
+        // Drop any handled-IDs that are no longer present, so a plug→unplug→
+        // replug cycle wakes the service again on the new attach.
+        val liveIds = live.map { it.deviceId }.toSet()
+        handledDeviceIds.retainAll(liveIds)
+        // Pick the first matching Headspace device we haven't already handed off.
+        val candidate = live.firstOrNull { d ->
+            d.deviceId !in handledDeviceIds && (
+                (d.vendorId == 0x1d6b && d.productId == 0x0104) ||
+                (d.productName?.contains("Headspace", ignoreCase = true) == true)
+            )
+        } ?: return
+        CrashLog.line(this, "USB",
+            "poll: found attached device id=${candidate.deviceId} " +
+            "vid=0x%04x pid=0x%04x — handing to service".format(
+                candidate.vendorId, candidate.productId))
+        handledDeviceIds.add(candidate.deviceId)
+        try { RecordingService.start(this, candidate) }
+        catch (e: Throwable) { CrashLog.writeException(this, "service.start (poll)", e) }
+    }
+
     private fun handleUsbAttach(intent: Intent?) {
         if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) {
             CrashLog.line(this, "USB", "handleUsbAttach: action=${intent?.action} (ignored)")
@@ -115,6 +175,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startRecordingFor(device: UsbDevice) {
+        if (device.deviceId in handledDeviceIds) {
+            CrashLog.line(this, "USB", "attach intent for already-handled device id=${device.deviceId}, ignoring")
+            return
+        }
+        handledDeviceIds.add(device.deviceId)
         try {
             RecordingService.start(this, device)
         } catch (e: Throwable) {

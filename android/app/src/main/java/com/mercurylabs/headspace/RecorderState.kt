@@ -1,6 +1,8 @@
 package com.mercurylabs.headspace
 
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
@@ -33,6 +35,17 @@ object RecorderState {
     @Volatile var previewSurface: android.view.Surface? = null
     /** Set by RecordingService; read by UI to know decoder state. */
     @Volatile var framesDecoded: Long = 0
+
+    /** Live AcmSerial owned by RecordingService — exposed so other UI
+     *  components (WiFi setup) can send commands without opening a SECOND
+     *  UsbDeviceConnection (which would steal the interface and kill IMU). */
+    @Volatile var acmSender: ((String) -> Unit)? = null
+
+    /** Non-IMU response lines from the Pi (anything not starting with "I:").
+     *  Replay buffer of 0 — late subscribers won't see old responses. */
+    private val _acmResponses = MutableSharedFlow<String>(extraBufferCapacity = 64)
+    val acmResponses = _acmResponses.asSharedFlow()
+    fun emitAcmResponse(line: String) { _acmResponses.tryEmit(line) }
 
     fun setIdle() {
         _state.value = Snapshot()

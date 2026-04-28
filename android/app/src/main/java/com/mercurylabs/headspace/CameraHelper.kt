@@ -26,6 +26,7 @@ class CameraHelper(
     private val ctx: Context,
     private val onFrame: (nv21: ByteArray, w: Int, h: Int) -> Unit,
     private val onState: (opened: Boolean, msg: String) -> Unit,
+    private val onDevice: (UsbDevice) -> Unit = {},
 ) : IDeviceConnectCallBack {
     private val client = MultiCameraClient(ctx, this)
     private var camera: MultiCameraClient.Camera? = null
@@ -40,10 +41,15 @@ class CameraHelper(
         // it ourselves and trigger the attach path.
         val list = client.getDeviceList(null) ?: emptyList()
         Log.i(TAG, "register: ${list.size} pre-attached USB device(s)")
-        for (d in list) {
-            Log.i(TAG, "  pre-attached vid=0x${"%04x".format(d.vendorId)} pid=0x${"%04x".format(d.productId)} '${d.productName}'")
-            onAttachDev(d)
-        }
+        // Defer onAttachDev so the UI has time to layout the SurfaceView and
+        // publish RecorderState.previewSurface — otherwise the camera opens
+        // against an off-screen SurfaceTexture and there's no live preview.
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            for (d in list) {
+                Log.i(TAG, "  pre-attached vid=0x${"%04x".format(d.vendorId)} pid=0x${"%04x".format(d.productId)} '${d.productName}'")
+                onAttachDev(d)
+            }
+        }, 600)
     }
 
     fun stop() {
@@ -58,6 +64,7 @@ class CameraHelper(
         if (camera != null) return
         val granted = client.hasPermission(device) == true
         Log.i(TAG, "device attached: ${device.productName} hasPermission=$granted")
+        try { onDevice(device) } catch (_: Throwable) {}
         if (granted) {
             // Library short-circuits requestPermission when permission is
             // already granted, but ALSO doesn't fire onConnectDev. Jump
@@ -114,7 +121,20 @@ class CameraHelper(
             .setPreviewWidth(1920)
             .setPreviewHeight(1080)
             .create()
-        cam.openCamera(null, req)
+        // Wait briefly for the UI's SurfaceView to publish its Surface — this
+        // happens within ~50ms of MainActivity's first compose, so a 1s budget
+        // is generous. If we time out, fall back to an off-screen SurfaceTexture
+        // so the camera still opens (frames arrive via callback regardless).
+        var renderTarget: Any = run {
+            var s = RecorderState.previewSurface
+            val deadline = System.currentTimeMillis() + 1000
+            while (s == null && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50); s = RecorderState.previewSurface
+            }
+            s ?: android.graphics.SurfaceTexture(0).apply { setDefaultBufferSize(1920, 1080) }
+        }
+        Log.i(TAG, "openCamera target=${renderTarget.javaClass.simpleName}")
+        cam.openCamera(renderTarget, req)
     }
 
     override fun onDisConnectDec(device: UsbDevice?, ctrlBlock: USBMonitor.UsbControlBlock?) {

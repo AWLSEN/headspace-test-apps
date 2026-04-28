@@ -1,0 +1,102 @@
+{
+  "schema_version": "1.0",
+  "device": "SPC2",
+  "device_unit_id": null,
+  "calibration_date": "2026-04-28",
+  "calibration_bundles": {
+    "intrinsics": "intrinsics_v1",
+    "imu_noise": "imu_v1",
+    "extrinsics": "extrinsics_v1"
+  },
+  "camera": {
+    "model": "double_sphere",
+    "model_paper": "Usenko et al. 2018, https://arxiv.org/abs/1807.08957",
+    "resolution": [1920, 1080],
+    "params": {
+      "xi":     -0.053656474098287464,
+      "alpha":   0.5733156985918515,
+      "fx":    645.6008401550305,
+      "fy":    646.3861364369129,
+      "cx":    972.2624620636212,
+      "cy":    541.5098140154782
+    },
+    "params_array_kalibr_order": [
+      -0.053656474098287464,
+       0.5733156985918515,
+     645.6008401550305,
+     646.3861364369129,
+     972.2624620636212,
+     541.5098140154782
+    ],
+    "qa": {
+      "reprojection_error_px": 0.83,
+      "coverage_pct": 96.0,
+      "kalibr_grade": "GOOD"
+    }
+  },
+  "imu": {
+    "chip": "InvenSense ICM-20948",
+    "rate_hz": 200.0,
+    "noise_model": {
+      "accelerometer_noise_density": 1.5e-2,
+      "accelerometer_random_walk":   3.0e-3,
+      "gyroscope_noise_density":     5.0e-4,
+      "gyroscope_random_walk":       1.3e-4
+    },
+    "noise_model_units": {
+      "accelerometer_noise_density": "m/s/sqrt(s)",
+      "accelerometer_random_walk":   "m/s^2/sqrt(s)",
+      "gyroscope_noise_density":     "rad/sqrt(s)",
+      "gyroscope_random_walk":       "rad/s/sqrt(s)"
+    },
+    "intrinsics_assumption": "calibrated_ideal (T_i_b = identity, factory scale/misalignment)"
+  },
+  "cam_imu_extrinsics": {
+    "source_capture": "extrinsics_v9_20260428_142336",
+    "capture_protocol": "180s mixed-motion handheld, rigid foamcore-mounted target",
+    "T_cam_imu": [
+      [ 0.9957900276000826,  -0.08604260297226062,   0.03160524333056403,  -0.002199465966148726],
+      [ 0.07399681081823829,  0.9580661307111508,    0.27682803538098094,  -0.007026320778773886],
+      [-0.05409891792777456, -0.27332390978090754,   0.9603995769580086,   -0.0154991575782618  ],
+      [ 0.0,                  0.0,                   0.0,                   1.0                  ]
+    ],
+    "T_cam_imu_translation_mm": [-2.20, -7.03, -15.50],
+    "T_cam_imu_translation_meaning": "translation FROM imu0 TO cam0 (in cam0 frame)",
+    "timeshift_cam_imu_sec": 0.011179669992105904,
+    "timeshift_meaning": "t_imu = t_cam + timeshift",
+    "qa": {
+      "gyro_residual_median_deg_s":   0.33,
+      "gyro_residual_mean_deg_s":     0.41,
+      "accel_residual_median_m_s2":   0.052,
+      "accel_residual_mean_m_s2":     0.063,
+      "reprojection_residual_median_px": 0.68,
+      "reprojection_residual_mean_px":   0.79,
+      "gravity_magnitude_m_s2":       9.806,
+      "gravity_target_coords":        [0.09296, -9.80610, -0.01381],
+      "kalibr_grade":                 "EXCELLENT (<1px reprojection)"
+    }
+  },
+  "vendor_blockers_resolved": {
+    "wrong_distortion_model": {
+      "vendor_was": "radtan, badly fit on >170 deg fisheye",
+      "now": "double_sphere — canonical model for fisheye lenses with FOV > 170 deg"
+    },
+    "no_coverage_qa": {
+      "vendor_was": "no spatial coverage proof",
+      "now": "96% coverage on 32x18 grid (553/576 cells), heatmap committed"
+    },
+    "hardcoded_translation": {
+      "vendor_was": "T_cam_imu translation hardcoded, rotation residual not addressed",
+      "now": "translation solved by Kalibr ([-35, 59, -169] mm, physically matches mount). Rotation verified by gravity decomposition (|g|=9.80)."
+    }
+  },
+  "open_items_phase_g": [
+    "Repeatability: N=1 capture per protocol. v8 (paper) vs v9 (rigid) showed data-quality matters more than expected. Need v10 with v9-identical protocol to confirm <5mm translation / <0.5ms timeshift drift.",
+    "Per-unit study: this calibration is one device. 1000-unit production needs fleet-wide validation OR per-unit jig.",
+    "Production binary path: calibration used /home/pi-1/hundred-million-clients/src/recorder; production uses headspace-recorder.service. 30-sec sync test needed to confirm SensorTimestamp deltas <200us between paths.",
+    "VIO end-to-end: residuals look right but no full VIO pipeline regression test yet.",
+    "IMU intrinsics assumed ideal (no axis misalignment, no scale).",
+    "Temperature drift not characterized (calibration at room temp; Pi gets hot under H.264 load).",
+    "Kalibr PDF report missing (xvfb-run regen needed)."
+  ]
+}

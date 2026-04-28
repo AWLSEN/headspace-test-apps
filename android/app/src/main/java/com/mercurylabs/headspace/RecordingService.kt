@@ -544,6 +544,16 @@ class RecordingService : LifecycleService() {
             put("imu_observed_hz", "%.1f".format(tracker.hz))
             put("stop_reason", reason)
             put("first_au_phone_ns", firstAuPtsNs)
+            // Embed the device calibration verbatim so each recording is
+            // a self-contained handoff to downstream VIO consumers — no
+            // side-channel needed to look up intrinsics / extrinsics.
+            try {
+                val calText = assets.open("spc2_calibration.json")
+                    .bufferedReader().use { it.readText() }
+                put("calibration", JSONObject(calText))
+            } catch (e: Throwable) {
+                CrashLog.writeException(this@RecordingService, "loadCalibration", e)
+            }
         }
         File(dir, "meta.json").writeText(meta.toString(2))
         CrashLog.line(this, "Recorder", "session stopped ($reason): ${dir.absolutePath} / $bytesWritten bytes / $auCount AUs")
